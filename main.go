@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"compress/gzip"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -56,6 +57,12 @@ type statusResponse struct {
 	StorageDir     string                `json:"storageDir"`
 	LogLevel       string                `json:"logLevel"`
 	TelemetryFiles []telemetryFileStatus `json:"telemetryFiles"`
+}
+
+type trackResponse struct {
+	ItemsReceived int   `json:"itemsReceived"`
+	ItemsAccepted int   `json:"itemsAccepted"`
+	Errors        []any `json:"errors"`
 }
 
 var (
@@ -127,21 +134,31 @@ func envInt(name string, fallback int) int {
 
 func newHandler(cfg config, writer *telemetryWriter) http.Handler {
 	mux := http.NewServeMux()
-	mux.HandleFunc("/v2/track", func(w http.ResponseWriter, r *http.Request) {
+	trackHandler := func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			w.Header().Set("Allow", http.MethodPost)
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
 
-		if err := ingestRequest(r.Body, writer); err != nil {
+		accepted, err := ingestRequest(r, writer)
+		if err != nil {
 			log.Printf("ingest failed: %v", err)
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
 
+		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
-	})
+		_ = json.NewEncoder(w).Encode(trackResponse{
+			ItemsReceived: accepted,
+			ItemsAccepted: accepted,
+			Errors:        []any{},
+		})
+	}
+
+	mux.HandleFunc("/v2/track", trackHandler)
+	mux.HandleFunc("/v2.1/track", trackHandler)
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			w.Header().Set("Allow", http.MethodGet)
@@ -180,28 +197,66 @@ func newHandler(cfg config, writer *telemetryWriter) http.Handler {
 	return mux
 }
 
-func ingestRequest(body io.Reader, writer *telemetryWriter) error {
-	payload, err := io.ReadAll(body)
+func ingestRequest(r *http.Request, writer *telemetryWriter) (int, error) {
+	bodyReader, err := decodeRequestBody(r)
 	if err != nil {
-		return fmt.Errorf("read request body: %w", err)
+		return 0, err
+	}
+
+	payload, err := io.ReadAll(bodyReader)
+	if err != nil {
+		return 0, fmt.Errorf("read request body: %w", err)
 	}
 
 	if len(payload) == 0 {
-		return errors.New("request body is empty")
+		return 0, errors.New("request body is empty")
 	}
 
 	envelopes, err := decodeEnvelopes(payload)
 	if err != nil {
-		return err
+		return 0, err
 	}
 
 	for _, env := range envelopes {
 		if err := writer.write(env); err != nil {
-			return err
+			return 0, err
 		}
 	}
 
-	return nil
+	return len(envelopes), nil
+}
+
+func decodeRequestBody(r *http.Request) (io.Reader, error) {
+	if isGzipEncoded(r.Header.Get("Content-Encoding")) {
+		reader, err := gzip.NewReader(r.Body)
+		if err != nil {
+			return nil, errors.New("invalid gzip request body")
+		}
+		defer reader.Close()
+
+		payload, err := io.ReadAll(reader)
+		if err != nil {
+			return nil, fmt.Errorf("read gzip request body: %w", err)
+		}
+
+		return bytes.NewReader(payload), nil
+	}
+
+	return r.Body, nil
+}
+
+func isGzipEncoded(contentEncoding string) bool {
+	if strings.TrimSpace(contentEncoding) == "" {
+		return false
+	}
+
+	for _, part := range strings.Split(strings.ToLower(contentEncoding), ",") {
+		if strings.TrimSpace(part) == "gzip" {
+			return true
+		}
+	}
+
+	return false
 }
 
 func decodeEnvelopes(payload []byte) ([]envelope, error) {
@@ -211,15 +266,44 @@ func decodeEnvelopes(payload []byte) ([]envelope, error) {
 	}
 
 	var single envelope
-	if err := json.Unmarshal(payload, &single); err != nil {
-		return nil, errors.New("request body must be a JSON array or object")
+	if err := json.Unmarshal(payload, &single); err == nil {
+		if err := validateEnvelopes([]envelope{single}); err != nil {
+			return nil, err
+		}
+
+		return []envelope{single}, nil
 	}
 
-	if err := validateEnvelopes([]envelope{single}); err != nil {
+	streamEnvelopes, err := decodeEnvelopeStream(payload)
+	if err != nil {
+		return nil, errors.New("request body must be a JSON array, object, or JSON stream")
+	}
+
+	return streamEnvelopes, nil
+}
+
+func decodeEnvelopeStream(payload []byte) ([]envelope, error) {
+	decoder := json.NewDecoder(bytes.NewReader(payload))
+	decoder.UseNumber()
+
+	var envelopes []envelope
+	for decoder.More() {
+		var env envelope
+		if err := decoder.Decode(&env); err != nil {
+			return nil, err
+		}
+		envelopes = append(envelopes, env)
+	}
+
+	if len(envelopes) == 0 {
+		return nil, errors.New("request body is empty")
+	}
+
+	if err := validateEnvelopes(envelopes); err != nil {
 		return nil, err
 	}
 
-	return []envelope{single}, nil
+	return envelopes, nil
 }
 
 func validateEnvelopes(envelopes []envelope) error {
